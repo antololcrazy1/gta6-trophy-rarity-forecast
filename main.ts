@@ -37,13 +37,18 @@
 //      Observed rates are clamped to [0.01, 99.99] for fitting, except an
 //      observed 0.00% counts as 0.005; a last observed rate <= 0.005 puts a
 //      at the lower bound. The p minimising the total squared logit error of
-//      the model over all distinct states wins (ties go to p = 0.7).
+//      the model over all distinct states wins (ties go to p = 0.7) — but
+//      only trophies whose last rate is fittable, in (0.05, 99), vote on p:
+//      a trophy at 0% or 100% cannot be fitted at all (a is capped), so its
+//      huge residual would otherwise pick p single-handedly.
 //   4. The median at the case target is the model rate at the target's tau
 //      with the chosen p and each trophy's a.
-//   5. Quantiles: sigma = sqrt(max(resid_var, 0.04) + (0.45 sqrt(days))^2
-//      + 0.01), where resid_var is the mean squared logit residual of the
-//      fitted model over the distinct states and days = horizon_minutes /
-//      1440; q_tau = inv_logit(logit(median) + z_tau sigma), z =
+//   5. Quantiles: sigma = sqrt(max(medianResidVar, 0.04) + (0.45 sqrt(days))^2
+//      + 0.01), capped at 1.2, where medianResidVar is the MEDIAN of the
+//      trophies' mean squared logit residuals (a pooled spread: one
+//      boundary trophy's un-fittable residual must not widen its own band
+//      tenfold) and days = horizon_minutes / 1440;
+//      q_tau = inv_logit(logit(median) + z_tau sigma), z =
 //      (-1.645, -0.674, 0, 0.674, 1.645), each q clamped to [0.01, 99.99]
 //      and rounded to 4 decimals.
 //
@@ -252,18 +257,29 @@ for (const file of inputs) {
 
   // Fit the global shape p: for each p, solve a per trophy against the last
   // distinct state, then total the squared logit error over all states.
-  // Ties go to p = 0.7.
+  // Only fittable trophies (last rate in (0.05, 99)) vote on p. Ties go to
+  // p = 0.7.
+  const lastRates = c.trophies.map((_, i) => {
+    const last = lastState.rates[i];
+    return last === null || last === undefined ? null : fitRate(last);
+  });
+  const votes = (i: number): boolean => {
+    const r = lastRates[i];
+    return r !== null && r > 0.05 && r < 99;
+  };
   const errors = new Map<number, number>();
   const aByP = new Map<number, number[]>();
   for (const p of P_GRID) {
     const as = c.trophies.map((_, i) => {
-      const last = lastState.rates[i];
-      if (last === null || last === undefined) return Math.exp(LOG_A_MIN);
-      return solveA(lastState.tau, fitRate(last), d, p);
+      const last = lastRates[i];
+      if (last === null) return Math.exp(LOG_A_MIN);
+      return solveA(lastState.tau, last, d, p);
     });
     aByP.set(p, as);
     let total = 0;
-    for (let i = 0; i < c.trophies.length; i++) total += trophyError(states, i, d, p, as[i]);
+    for (let i = 0; i < c.trophies.length; i++) {
+      if (votes(i)) total += trophyError(states, i, d, p, as[i]);
+    }
     errors.set(p, total);
   }
   const bestErr = Math.min(...errors.values());
@@ -280,11 +296,20 @@ for (const file of inputs) {
   }
   const aBest = aByP.get(pBest) ?? [];
 
+  // One pooled spread for every trophy: the median of the trophies' mean
+  // squared logit residuals, so a boundary trophy's un-fittable residual
+  // cannot widen its own band tenfold. Capped at 1.2 logit units.
+  const residVars = c.trophies.map((_, i) => trophyError(states, i, d, pBest, aBest[i] ?? Math.exp(LOG_A_MIN)));
+  const sortedVars = residVars.slice().sort((x, y) => x - y);
+  const medianResidVar = sortedVars.length === 0 ? 0 : sortedVars[Math.floor(sortedVars.length / 2)];
+  const sigma = Math.min(
+    1.2,
+    Math.sqrt(Math.max(medianResidVar, 0.04) + Math.pow(0.45 * Math.sqrt(days), 2) + 0.01),
+  );
+
   const trophies = c.trophies.map((t, i) => {
     const a = aBest[i] ?? Math.exp(LOG_A_MIN);
     const median = clampPct(modelRate(tauTarget, d, pBest, a));
-    const residVar = trophyError(states, i, d, pBest, a);
-    const sigma = Math.sqrt(Math.max(residVar, 0.04) + Math.pow(0.45 * Math.sqrt(days), 2) + 0.01);
     const l = logit(median);
     const q = Z.map((z) => round4(clampPct(invLogitPct(l + z * sigma))));
     // Rounding can only move a value by 0.00005; enforce non-decreasing.
